@@ -48,7 +48,9 @@ struct lock {
 	unsigned int xoff, yoff, mw, mh;
 	Drawable drawable;
 	GC gc;
-	XRectangle rectangles[LENGTH(rectangles)];
+	XftDraw *draw;
+	XftFont *font;
+	XftColor xftcolors[NUMCOLS];
 };
 
 struct xrandr {
@@ -81,15 +83,15 @@ dontkillme(void)
 	if (!(f = fopen(oomfile, "w"))) {
 		if (errno == ENOENT)
 			return;
-		die("slock: fopen %s: %s\n", oomfile, strerror(errno));
+		die("doomlock: fopen %s: %s\n", oomfile, strerror(errno));
 	}
 	fprintf(f, "%d", OOM_SCORE_ADJ_MIN);
 	if (fclose(f)) {
 		if (errno == EACCES)
-			die("slock: unable to disable OOM killer. "
-			    "Make sure to suid or sgid slock.\n");
+			die("doomlock: unable to disable OOM killer. "
+			    "Make sure to suid or sgid doomlock.\n");
 		else
-			die("slock: fclose %s: %s\n", oomfile, strerror(errno));
+			die("doomlock: fclose %s: %s\n", oomfile, strerror(errno));
 	}
 }
 #endif
@@ -104,9 +106,9 @@ gethash(void)
 	errno = 0;
 	if (!(pw = getpwuid(getuid()))) {
 		if (errno)
-			die("slock: getpwuid: %s\n", strerror(errno));
+			die("doomlock: getpwuid: %s\n", strerror(errno));
 		else
-			die("slock: cannot retrieve password entry\n");
+			die("doomlock: cannot retrieve password entry\n");
 	}
 	hash = pw->pw_passwd;
 
@@ -114,20 +116,20 @@ gethash(void)
 	if (!strcmp(hash, "x")) {
 		struct spwd *sp;
 		if (!(sp = getspnam(pw->pw_name)))
-			die("slock: getspnam: cannot retrieve shadow entry. "
-			    "Make sure to suid or sgid slock.\n");
+			die("doomlock: getspnam: cannot retrieve shadow entry. "
+			    "Make sure to suid or sgid doomlock.\n");
 		hash = sp->sp_pwdp;
 	}
 #else
 	if (!strcmp(hash, "*")) {
 #ifdef __OpenBSD__
 		if (!(pw = getpwuid_shadow(getuid())))
-			die("slock: getpwnam_shadow: cannot retrieve shadow entry. "
-			    "Make sure to suid or sgid slock.\n");
+			die("doomlock: getpwnam_shadow: cannot retrieve shadow entry. "
+			    "Make sure to suid or sgid doomlock.\n");
 		hash = pw->pw_passwd;
 #else
-		die("slock: getpwuid: cannot retrieve shadow entry. "
-		    "Make sure to suid or sgid slock.\n");
+		die("doomlock: getpwuid: cannot retrieve shadow entry. "
+		    "Make sure to suid or sgid doomlock.\n");
 #endif /* __OpenBSD__ */
 	}
 #endif /* HAVE_SHADOW_H */
@@ -136,27 +138,33 @@ gethash(void)
 }
 
 static void
-resizerectangles(struct lock *lock)
-{
-	int i;
-
-	for (i = 0; i < LENGTH(rectangles); i++){
-		lock->rectangles[i].x = (rectangles[i].x * logosize)
-                                + lock->xoff + ((lock->mw) / 2) - (logow / 2 * logosize);
-		lock->rectangles[i].y = (rectangles[i].y * logosize)
-                                + lock->yoff + ((lock->mh) / 2) - (logoh / 2 * logosize);
-		lock->rectangles[i].width = rectangles[i].width * logosize;
-		lock->rectangles[i].height = rectangles[i].height * logosize;
-	}
-}
-
-static void
 drawlogo(Display *dpy, struct lock *lock, int color)
 {
+	int i, x, y, maxw, w, lineh, logoh;
+	XGlyphInfo ext;
+
 	XSetForeground(dpy, lock->gc, lock->colors[BACKGROUND]);
 	XFillRectangle(dpy, lock->drawable, lock->gc, 0, 0, lock->x, lock->y);
-	XSetForeground(dpy, lock->gc, lock->colors[color]);
-	XFillRectangles(dpy, lock->drawable, lock->gc, lock->rectangles, LENGTH(rectangles));
+
+	maxw = 0;
+	for (i = 0; i < LENGTH(asciilogo); i++) {
+		XftTextExtentsUtf8(dpy, lock->font, (FcChar8 *)asciilogo[i],
+		                    strlen(asciilogo[i]), &ext);
+		w = ext.xOff;
+		if (w > maxw)
+			maxw = w;
+	}
+
+	lineh = lock->font->ascent + lock->font->descent;
+	logoh = LENGTH(asciilogo) * lineh;
+	x = (int)lock->xoff + ((int)lock->mw - maxw) / 2;
+	y = (int)lock->yoff + ((int)lock->mh - logoh) / 2 + lock->font->ascent;
+
+	for (i = 0; i < LENGTH(asciilogo); i++)
+		XftDrawStringUtf8(lock->draw, &lock->xftcolors[color], lock->font,
+		                  x, y + i * lineh, (FcChar8 *)asciilogo[i],
+		                  strlen(asciilogo[i]));
+
 	XCopyArea(dpy, lock->drawable, lock->win, lock->gc, 0, 0, lock->x, lock->y, 0, 0);
 	XSync(dpy, False);
 }
@@ -198,7 +206,7 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 				passwd[len] = '\0';
 				errno = 0;
 				if (!(inputhash = crypt(passwd, hash)))
-					fprintf(stderr, "slock: crypt: %s\n", strerror(errno));
+					fprintf(stderr, "doomlock: crypt: %s\n", strerror(errno));
 				else
 					running = !!strcmp(inputhash, hash);
 				if (running) {
@@ -289,6 +297,19 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 	lock->drawable = XCreatePixmap(dpy, lock->root,
             lock->x, lock->y, DefaultDepth(dpy, screen));
 	lock->gc = XCreateGC(dpy, lock->root, 0, NULL);
+	lock->draw = XftDrawCreate(dpy, lock->drawable,
+	                           DefaultVisual(dpy, lock->screen),
+	                           DefaultColormap(dpy, lock->screen));
+	if (!lock->draw)
+		die("doomlock: unable to create xft draw target\n");
+	if (!(lock->font = XftFontOpenName(dpy, lock->screen, logofont)))
+		die("doomlock: unable to load font %s\n", logofont);
+	for (i = 0; i < NUMCOLS; i++) {
+		if (!XftColorAllocName(dpy, DefaultVisual(dpy, lock->screen),
+		                       DefaultColormap(dpy, lock->screen),
+		                       colorname[i], &lock->xftcolors[i]))
+			die("doomlock: unable to allocate xft color %s\n", colorname[i]);
+	}
 	XSetLineAttributes(dpy, lock->gc, 1, LineSolid, CapButt, JoinMiter);
 
 	/* init */
@@ -304,8 +325,6 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 	invisible = XCreatePixmapCursor(dpy, lock->pmap, lock->pmap,
 	                                &color, &color, 0, 0);
 	XDefineCursor(dpy, lock->win, invisible);
-
-	resizerectangles(lock);
 
 	/* Try to grab mouse pointer *and* keyboard for 600ms, else fail the lock */
 	for (i = 0, ptgrab = kbgrab = -1; i < 6; i++) {
@@ -341,10 +360,10 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 
 	/* we couldn't grab all input: fail out */
 	if (ptgrab != GrabSuccess)
-		fprintf(stderr, "slock: unable to grab mouse pointer for screen %d\n",
+		fprintf(stderr, "doomlock: unable to grab mouse pointer for screen %d\n",
 		        screen);
 	if (kbgrab != GrabSuccess)
-		fprintf(stderr, "slock: unable to grab keyboard for screen %d\n",
+		fprintf(stderr, "doomlock: unable to grab keyboard for screen %d\n",
 		        screen);
 	return NULL;
 }
@@ -352,7 +371,7 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 static void
 usage(void)
 {
-	die("usage: slock [-v] [cmd [arg ...]]\n");
+	die("usage: doomlock [-v] [cmd [arg ...]]\n");
 }
 
 int
@@ -365,11 +384,11 @@ main(int argc, char **argv) {
 	gid_t dgid;
 	const char *hash;
 	Display *dpy;
-	int s, nlocks, nscreens;
+	int i, s, nlocks, nscreens;
 
 	ARGBEGIN {
 	case 'v':
-		fprintf(stderr, "slock-"VERSION"\n");
+		fprintf(stderr, "doomlock-"VERSION"\n");
 		return 0;
 	default:
 		usage();
@@ -378,12 +397,12 @@ main(int argc, char **argv) {
 	/* validate drop-user and -group */
 	errno = 0;
 	if (!(pwd = getpwnam(user)))
-		die("slock: getpwnam %s: %s\n", user,
+		die("doomlock: getpwnam %s: %s\n", user,
 		    errno ? strerror(errno) : "user entry not found");
 	duid = pwd->pw_uid;
 	errno = 0;
 	if (!(grp = getgrnam(group)))
-		die("slock: getgrnam %s: %s\n", group,
+		die("doomlock: getgrnam %s: %s\n", group,
 		    errno ? strerror(errno) : "group entry not found");
 	dgid = grp->gr_gid;
 
@@ -394,18 +413,18 @@ main(int argc, char **argv) {
 	hash = gethash();
 	errno = 0;
 	if (!crypt("", hash))
-		die("slock: crypt: %s\n", strerror(errno));
+		die("doomlock: crypt: %s\n", strerror(errno));
 
 	if (!(dpy = XOpenDisplay(NULL)))
-		die("slock: cannot open display\n");
+		die("doomlock: cannot open display\n");
 
 	/* drop privileges */
 	if (setgroups(0, NULL) < 0)
-		die("slock: setgroups: %s\n", strerror(errno));
+		die("doomlock: setgroups: %s\n", strerror(errno));
 	if (setgid(dgid) < 0)
-		die("slock: setgid: %s\n", strerror(errno));
+		die("doomlock: setgid: %s\n", strerror(errno));
 	if (setuid(duid) < 0)
-		die("slock: setuid: %s\n", strerror(errno));
+		die("doomlock: setuid: %s\n", strerror(errno));
 
 	/* check for Xrandr support */
 	rr.active = XRRQueryExtension(dpy, &rr.evbase, &rr.errbase);
@@ -413,7 +432,7 @@ main(int argc, char **argv) {
 	/* get number of screens in display "dpy" and blank them */
 	nscreens = ScreenCount(dpy);
 	if (!(locks = calloc(nscreens, sizeof(struct lock *))))
-		die("slock: out of memory\n");
+		die("doomlock: out of memory\n");
 	for (nlocks = 0, s = 0; s < nscreens; s++) {
 		if ((locks[s] = lockscreen(dpy, &rr, s)) != NULL)
 			nlocks++;
@@ -430,12 +449,12 @@ main(int argc, char **argv) {
 	if (argc > 0) {
 		switch (fork()) {
 		case -1:
-			die("slock: fork failed: %s\n", strerror(errno));
+			die("doomlock: fork failed: %s\n", strerror(errno));
 		case 0:
 			if (close(ConnectionNumber(dpy)) < 0)
-				die("slock: close: %s\n", strerror(errno));
+				die("doomlock: close: %s\n", strerror(errno));
 			execvp(argv[0], argv);
-			fprintf(stderr, "slock: execvp %s: %s\n", argv[0], strerror(errno));
+			fprintf(stderr, "doomlock: execvp %s: %s\n", argv[0], strerror(errno));
 			_exit(1);
 		}
 	}
@@ -444,6 +463,12 @@ main(int argc, char **argv) {
 	readpw(dpy, &rr, locks, nscreens, hash);
 
 	for (nlocks = 0, s = 0; s < nscreens; s++) {
+		for (i = 0; i < NUMCOLS; i++)
+			XftColorFree(dpy, DefaultVisual(dpy, locks[s]->screen),
+			             DefaultColormap(dpy, locks[s]->screen),
+			             &locks[s]->xftcolors[i]);
+		XftFontClose(dpy, locks[s]->font);
+		XftDrawDestroy(locks[s]->draw);
 		XFreePixmap(dpy, locks[s]->drawable);
 		XFreeGC(dpy, locks[s]->gc);
 	}
